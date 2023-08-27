@@ -2,111 +2,22 @@
 
 import cv2
 import numpy as np
-from scipy import ndimage
+from scipy import ndimage as ndi
 
+import matplotlib
 from matplotlib import pyplot as plt
+from scipy import signal
+from scipy.signal import convolve2d
 
+import pywt
+from scipy import stats
+from tabulate import tabulate
+
+import csv
+import sys
 import argparse, os
 
-import warnings
-warnings.filterwarnings("ignore")
-
-def print_help():
-    print("grain_analysis.py path_to_folder")
-
-def ee(LH: np.array, HL: np.array, p = 2):
-    return np.sqrt(LH**p + HL**p)**(1/p)
-
-def generate_energy_map(img):
-    h = 0.125 * np.array([-1, 2, 6, 2, -1],     dtype=np.float32)
-    g1 = 0.5 * np.array([1, 0, -1],            dtype=np.float32)
-    g2 = 0.5 * np.array([1, 0, 0, 0, -1],      dtype=np.float32)
-    g3 = 0.5 * np.array([1, 0, 0, 0, 0, 0 -1], dtype=np.float32)
-
-    f1 = np.matrix(np.convolve(h, g1))
-    imgf1h = cv2.filter2D(img, -1, f1)
-    imgf1v = cv2.filter2D(img, -1, f1.T)
-    ee1 = ee(imgf1h, imgf1v)
-
-    f2 = np.matrix(np.convolve(h, g2))
-    imgf2h = cv2.filter2D(img, -1, f2)
-    imgf2v = cv2.filter2D(img, -1, f2.T)
-    ee2 = ee(imgf2h, imgf2v)
-
-    f3 = np.matrix(np.convolve(h, g3))
-    imgf3h = cv2.filter2D(img, -1, f3)
-    imgf3v = cv2.filter2D(img, -1, f3.T)
-    ee3 = ee(imgf3h, imgf3v)
-
-    return np.maximum(np.maximum(ee1, ee2), ee3)
-
-def get_thresholds(img, energy_map):
-    img_thresh = np.floor(img*0.125)
-    img_thresh = np.array(img_thresh, dtype=np.uint8)
-
-    thresholds = np.full(32, 3, dtype=np.float32)
-    w = 10E-4
-    c = 2.5
-
-    for _ in range(10):
-        for value in range(32):
-            mask = np.zeros(img.shape, dtype=np.uint8)
-            mask[img_thresh==value] = 1
-            thresholds[value] = (1-w) * thresholds[value] + w*c * np.mean(energy_map[mask==1])
-
-    return np.nan_to_num(thresholds, nan=3), img_thresh
-
-def clean_edges(energy_map):
-    cleaned = cv2.medianBlur(np.array(energy_map, dtype=np.uint8), 5)
-
-    nb_blobs, im_with_separated_blobs, stats, _ = cv2.connectedComponentsWithStats(cleaned)
-    sizes = stats[:, -1]
-    sizes = sizes[1:]
-    nb_blobs -= 1
-
-    min_size = 30
-
-    cleaned = np.zeros_like(im_with_separated_blobs)
-
-    for blob in range(nb_blobs):
-        if sizes[blob] >= min_size:
-            cleaned[im_with_separated_blobs == blob + 1] = 255
-
-    return cleaned
-
-def analyze_grain(img, areas, index, imgname, outfolder):
-    area = img.copy()
-    area = np.array(img, dtype=np.float32)
-    area[areas!=index] = -1
-
-    noise_min = np.min(area[areas==index])
-    noise_mean = np.mean(area[areas==index])
-    noise_median = np.median(area[areas==index])
-    noise_std  = np.std(area[areas==index])
-
-    only_noise = img.copy()
-    only_noise[areas!=index] = 0
-    plt.imshow(only_noise, cmap="gray")
-    plt.savefig(os.path.join(outfolder, "areas", imgname + "_" + str(index) + ".png"))
-    plt.close()
-    
-    fft_img = np.fft.fftshift(np.fft.fft2(only_noise))
-    plt.figure()
-    plt.imshow(np.log(abs(fft_img)))
-    plt.savefig(os.path.join(outfolder, "fft", imgname + "_" + str(index) + ".png"))
-    plt.close()
-
-    hist, edges = np.histogram(area[areas==index], bins=256, range=(0,255))
-    hist = hist/np.sum(hist)
-    edges = edges-noise_mean
-    plt.figure()
-    plt.stairs(hist, edges)
-    plt.savefig(os.path.join(outfolder, "histogram", imgname + "_" + str(index) + ".png"))
-    plt.close()
-
-    return noise_min, noise_mean, noise_median, noise_std
-
-    
+from analysis_library import *
 
 if __name__ == '__main__':
     
@@ -114,6 +25,7 @@ if __name__ == '__main__':
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--path", "-p", help="Path to folder with images.")
+    parser.add_argument("--out", "-o", help="Parent output path.")
 
     args=parser.parse_args()
 
@@ -121,67 +33,93 @@ if __name__ == '__main__':
         path = "."
     else:
         path = args.path
+    if args.out is None:
+        outpath = "./analysis_output"
+    else:
+        outpath = args.out
     
 
     # Iterate through images in database
 
-    all_files = []
+    all_images = []
     for filename in os.listdir(path):
         img_path = os.path.join(path, filename)
         if not os.path.isfile(img_path):
             continue
-        all_files.append(img_path)
-    all_files.sort()
+        all_images.append(filename)
+    all_images.sort()
 
-    # Now analyse the image
+    if not os.path.exists(outpath):
+        os.mkdir(outpath)
 
-    parameters = []
-    for img_path in all_files:
-        print("Working on image {0}".format(img_path))
+    csv_header = ["name", "min", "max", "mean", "median", "std", "kurtosis", "skewness"]
 
-        img = cv2.imread(img_path)
+    # Now analyse the images
+    
+    unsegmented = []
+    for img_name in all_images:
+        print("Working on image {0}...".format(img_name))
+
+        local_outpath = os.path.join(outpath, img_name[:-4])
+        if not os.path.exists(local_outpath):
+            os.mkdir(local_outpath)
+
+        current_noise_data = []
+
+        img = cv2.imread(os.path.join(path, img_name))
         img = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-        # Bluring helps with very noisy images:
-        #img = cv2.medianBlur(img, 3)
+        cv2.imwrite(os.path.join(local_outpath, "noisy.png"), img)
 
-        energy_map = generate_energy_map(img)
-        thresholds, img_thresh = get_thresholds(img, energy_map)
+        energy_map = calculate_energy_map(img)
+        energy_map[energy_map < 2*np.median(energy_map)] = 0
+        energy_map[energy_map > 0] = 1
 
-        for val in range(32):
-            energy_map[img_thresh==val] = (energy_map[img_thresh==val] > thresholds[val])
+        edge_map = clean_edge_map(energy_map)
 
-        cleaned = clean_edges(energy_map)
-
-        dilation_kernel = np.ones((31,31), dtype=np.uint8)
-        final_mask = cv2.dilate(np.array(cleaned, dtype=np.uint8), dilation_kernel, iterations=1)
+        dilation_kernel = np.ones((15,15), dtype=np.uint8)
+        final_mask = cv2.dilate(np.array(edge_map, dtype=np.uint8), dilation_kernel, iterations=1)
         final_mask = cv2.bitwise_not(final_mask)
         final_mask[final_mask < 255] = 0
+        final_mask[final_mask != 0] = 1
 
-        connectivity_map = np.ones((3,3), dtype=np.uint8)
-        areas, num_features = ndimage.label(final_mask, connectivity_map)
+        areas, grain_area_indices, num_features = segment_areas(img, final_mask)        
 
-        vals, counts = np.unique(areas, return_counts=True)
-        threshold_min = max(np.median(counts), 10000)
-        threshold_max = img.size[0]*img.size[1]*0.5
-        grain_area_indices = []
-        for val, cnt in zip(vals[1:], counts[1:]):
-            if cnt > threshold_min and cnt < threshold_max:
-                grain_area_indices.append(val)
+        for id in grain_area_indices:
+            current_area = np.array(img, dtype=np.float32)
+            current_area[areas!=id] = -1
 
-        print("Number of detected areas: {0}".format(len(grain_area_indices)))
-        
-        for index in grain_area_indices:
-            parameters.append(analyze_grain(img, areas, index, img_path[-7:-4], "results"))
+            hist, edges = np.histogram(current_area[areas==id], bins=256, range=(0,255))
+            hist = hist/np.sum(hist)
+            plt.figure()
+            plt.stairs(hist, edges)
+            plt.savefig(os.path.join(local_outpath, str(id) + "_hist.png"))
 
-       
-    with open("results/parameters.txt", "w") as of:
-        of.write("MIN MEAN MEDIAN STD\n")
-        for param in parameters:
-            of.write(str(param) + "\n")
+            maxima, smoothed_hist = find_maxima(hist)
 
+            if len(maxima)>0 and np.max(maxima) - np.min(maxima) > 40:
+                ret, _ = cv2.threshold(np.array(current_area, dtype = np.uint8)[areas==id], 
+                                       0, 255, cv2.THRESH_BINARY+cv2.THRESH_OTSU)
+                lower = current_area[np.logical_and(
+                    areas==id, current_area < ret)]
+                upper = current_area[np.logical_and(
+                    areas==id, current_area >= ret)]
+                current_noise_data.append(statistic_analysis(lower,  str(id) + "_1")) 
+                current_noise_data.append(statistic_analysis(upper, str(id) +  "_2"))
+                extract_segment(current_area, local_outpath, str(id), ret)
+            else:
+                current_noise_data.append(statistic_analysis(current_area[areas==id], str(id)))
+                extract_segment(current_area, local_outpath, str(id))
 
-        #plt.figure()
-        #plt.imshow(final_mask, cmap="gray")
-        #plt.show()
+        if len(current_noise_data) > 0:
+            with open(os.path.join(local_outpath, "noise_data.csv"), "w", newline='') as f:
+                writer = csv.writer(f)
+                writer.writerow(csv_header)
+                writer.writerows(current_noise_data)
+        else:
+            unsegmented.append(img_name[:-4])
     
+    print(unsegmented)
+    np.savetxt(os.path.join(outpath, "unsegmented.txt"), unsegmented)
+
+
 
