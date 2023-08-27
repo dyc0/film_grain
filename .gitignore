@@ -1,3 +1,5 @@
 res/
 .*
 !.gitignore
+__pycache__/
+analysis_output/
