@@ -3,3 +3,6 @@ res/
 !.gitignore
 __pycache__/
 analysis_output/
+film_grain_rendering_main
+subprocess_log.txt
+switch_point.txt

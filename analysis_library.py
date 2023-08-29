@@ -128,6 +128,39 @@ def extract_segment(img_segment: np.ndarray, path: str, name: str, threshold = N
     else:
         save_segment(img_segment, path, name)
 
+def extract_segment_mask(img_segment: np.ndarray, path: str, name: str, threshold = None):
+    if threshold is not None:
+        lower = img_segment.copy()
+        lower[np.logical_or(lower>=threshold, lower<0)] = 0
+        lower[lower>0] = 1
+        save_mask(lower, path, 'mask_' + name + '_1.txt')
+    
+        upper = img_segment.copy()
+        upper[upper < threshold] = 0
+        upper[upper >0] = 1
+        upper = upper.astype(np.uint8)
+        save_mask(upper, path, 'mask_' + name + '_2.txt')
+        
+    else:
+        mask = img_segment.copy()
+        mask[mask!=-1] = 1
+        mask[mask==-1] = 0
+        save_mask(mask, path, 'mask_' + name + '.txt')
+
+def save_mask(img_segment: np.ndarray, path: str, name: str):
+    mask = img_segment.copy()
+    mask = mask.astype(np.uint8)
+
+    rows = np.any(mask, axis=1)
+    cols = np.any(mask, axis=0)
+    rmin, rmax = np.where(rows)[0][[0, -1]]
+    cmin, cmax = np.where(cols)[0][[0, -1]]
+
+    np.savetxt(os.path.join(path, name),
+               img_segment[rmin:rmax, cmin:cmax], fmt='%i')
+
+   
+
 def save_segment(img_segment: np.ndarray, path: str, name: str):
     mask = img_segment.copy()
     mask[mask>0] = 1
